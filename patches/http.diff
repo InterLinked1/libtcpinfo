@@ -1,0 +1,235 @@
+diff --git a/include/mod_http.h b/include/mod_http.h
+index 028620f..5ccd1f0 100644
+--- a/include/mod_http.h
++++ b/include/mod_http.h
+@@ -133,6 +133,13 @@ struct http_response {
+ 	unsigned int chunked:1;		/*!< Response uses chunked transfer encoding */
+ };
+ 
++/* #define HAVE_TCPINFO_LIB */
++#define HAVE_TCPINFO_LIB
++
++#ifdef HAVE_TCPINFO_LIB
++struct tcp_session;
++#endif
++
+ struct http_session {
+ 	struct http_request *req;
+ 	struct http_response *res;
+@@ -141,6 +148,9 @@ struct http_session {
+ 	struct bbs_node *node;
+ 	struct readline_data *rldata;
+ 	char *buf; /*!< Stack-allocated readline data buffer */
++#ifdef HAVE_TCPINFO_LIB
++	struct tcp_session *tcp;
++#endif
+ 	unsigned int secure:1;
+ };
+ 
+diff --git a/modules/Makefile b/modules/Makefile
+index 6137d7b..0a77a0a 100644
+--- a/modules/Makefile
++++ b/modules/Makefile
+@@ -10,6 +10,9 @@ GMIME_FLAGS=$(shell pkg-config --cflags glib-2.0 gmime-3.0)
+ GMIME_LIBS=$(shell pkg-config --libs glib-2.0 gmime-3.0)
+ MYSQL_LIBS := $(shell mysql_config --libs)
+ 
++# Since we don't use autoconf:
++TCPINFO_LIB_EXISTS = $(ls /usr/lib/libtcpinfo.so | grep "tcpinfo")
++
+ ETPANCFLAGS=-I/usr/local/include
+ 
+ all: $(MOD_SO)
+@@ -45,7 +48,11 @@ mod_discord.so : mod_discord.o
+ 
+ mod_http.so : mod_http.o
+ 	@echo "  [LD] $^ -> $@"
++ifneq ($(TCPINFO_LIB_EXISTS),0)
++	$(CC) -shared -fPIC -o $(basename $^).so $^ -lmagic -ltcpinfo
++else
+ 	$(CC) -shared -fPIC -o $(basename $^).so $^ -lmagic
++endif
+ 
+ mod_irc_client.so : mod_irc_client.o
+ 	@echo "  [LD] $^ -> $@"
+diff --git a/modules/mod_http.c b/modules/mod_http.c
+index 165d3f3..83eae08 100644
+--- a/modules/mod_http.c
++++ b/modules/mod_http.c
+@@ -58,6 +58,10 @@
+ 
+ #include "include/mod_http.h"
+ 
++#ifdef HAVE_TCPINFO_LIB
++#include <tcpinfo.h>
++#endif
++
+ #define SERVER_NAME BBS_TAGLINE " " BBS_VERSION " Web Server"
+ 
+ #define DEFAULT_MIME_TYPE "application/octet-stream"
+@@ -145,12 +149,22 @@ static enum http_method proxy_methods = HTTP_METHOD_UNDEF;
+ /*! \brief Actually write data to the HTTP client (potentially abstracted by TLS) */
+ static inline ssize_t __http_direct_write(struct http_session *http, const char *buf, size_t len)
+ {
++#ifdef HAVE_TCPINFO_LIB
++	if (http->tcp) {
++		return tcp_write(http->tcp, buf, len);
++	}
++#endif
+ 	return bbs_node_fd_write(http->node, http->node->wfd, buf, len);
+ }
+ 
+ /*! \brief sendfile wrapper for HTTP clients */
+ static inline ssize_t http_sendfile(struct http_session *http, int in_fd, off_t *offset, size_t count)
+ {
++#ifdef HAVE_TCPINFO_LIB
++	if (http->tcp) {
++		return tcp_sendfile(http->tcp, in_fd, offset, count);
++	}
++#endif
+ 	return bbs_sendfile(http->node->wfd, in_fd, offset, count);
+ }
+ 
+@@ -1945,6 +1959,19 @@ static void http_handler(struct bbs_node *node, int secure)
+ 	bbs_readline_init(&rldata, buf, sizeof(buf));
+ 	http.buf = buf;
+ 
++#ifdef HAVE_TCPINFO_LIB
++	if (!secure) {
++		/* If TLS, then http.wfd isn't a socket, it's a pipe...
++		 * while it's possible to monitor the stats still using http.fd,
++		 * it's most natural in the current architecture to do this
++		 * just for HTTP. */
++		http.tcp = tcp_create(http.node->wfd, 0);
++		if (!http.tcp) {
++			bbs_error("Failed to create TCP info session: %s\n", strerror(errno));
++		}
++	}
++#endif
++
+ 	do {
+ 		res = http_handle_request(&http, buf);
+ 		if (res > 0) {
+@@ -1985,7 +2012,36 @@ static void http_handler(struct bbs_node *node, int secure)
+ 			bbs_event_dispatch(http.node, EVENT_NODE_BAD_REQUEST);
+ 		}
+ 		http_session_cleanup(&http);
++#ifdef HAVE_TCPINFO_LIB
++		if (http.tcp) {
++			if (tcp_speed_converged(http.tcp)) {
++				/* After the first response where speed has converged,
++				 * store the speed to the session for future reference, if a session exists. */
++				if (tcp_speed_is_broadband(http.tcp)) {
++					bbs_debug(4, "%lu B was downloaded by client at broadband speeds\n", tcp_bytes_sent(http.tcp));
++				} else {
++					bbs_debug(4, "%lu B was downloaded by client at ~%f\n", tcp_bytes_sent(http.tcp), tcp_speed(http.tcp));
++				}
++				if (http.req->session) {
++					if (tcp_speed_is_broadband(http.tcp)) {
++						http_session_set_var(&http, "TCPINFO_speed", "broadband");
++					} else {
++						char speedbuf[25];
++						snprintf(speedbuf, sizeof(speedbuf), "%d", (int) tcp_speed(http.tcp));
++						http_session_set_var(&http, "TCPINFO_speed", speedbuf);
++					}
++				}
++			} else {
++				bbs_debug(6, "Client's speed did not converge before session ended, session too short (%lu B downloaded)\n", tcp_bytes_sent(http.tcp));
++			}
++		}
++#endif
+ 	} while (res >= 0 && http.req->keepalive);
++#ifdef HAVE_TCPINFO_LIB
++	if (http.tcp) {
++		tcp_destroy(http.tcp);
++	}
++#endif
+ }
+ 
+ /*! \brief 80 columns of spaces */
+diff --git a/modules/mod_http_tcpinfo.c b/modules/mod_http_tcpinfo.c
+new file mode 100644
+index 0000000..f118aef
+--- /dev/null
++++ b/modules/mod_http_tcpinfo.c
+@@ -0,0 +1,80 @@
++/*
++ * LBBS -- The Lightweight Bulletin Board System
++ *
++ * Copyright (C) 2023-2024, Naveen Albert
++ *
++ * Naveen Albert <bbs@phreaknet.org>
++ *
++ * This program is free software, distributed under the terms of
++ * the GNU General Public License Version 2. See the LICENSE file
++ * at the top of the source tree.
++ */
++
++/*! \file
++ *
++ * \brief Web client speed demo
++ *
++ * \author Naveen Albert <bbs@phreaknet.org>
++ */
++
++#include "include/bbs.h"
++
++#include <string.h>
++
++#include "include/module.h"
++#include "include/config.h"
++#include "include/node.h"
++#include "include/user.h"
++#include "include/utils.h"
++
++/* Needed for mod_http.h */
++#include "include/linkedlists.h"
++#include "include/variables.h"
++
++#include "include/mod_http.h"
++
++static enum http_response_code tcpinfo_handler(struct http_session *http)
++{
++	if (http->node->secure) {
++		http_writef(http, "This page may only be accessed over HTTP\r\n");
++		return HTTP_NOT_FOUND;
++	}
++	if (http_session_start(http, 0)) {
++		return HTTP_INTERNAL_SERVER_ERROR;
++	}
++
++	if (!http_session_var(http, "TCPINFO_speed")) {
++		/* Don't know what the client's speed is yet for sure... do something sane or send the default content */
++		http_writef(http, "<p>I am not yet sure what your speed is... try making some more requests and check again.</p>");
++		return HTTP_OK;
++	}
++
++	/* From previous responses, we know the client's speed so we can use that to optimize the content that we send: */
++	http_writef(http, "<p>Your speed is: %s</p>", http_session_var(http, "TCPINFO_speed"));
++
++	return HTTP_OK;
++}
++
++static int unload_module(void)
++{
++	http_unregister_route(tcpinfo_handler);
++	return 0;
++}
++
++static int load_module(void)
++{
++	int res = 0;
++
++	/* If net_http is running, at least one of HTTP or HTTPS must be running */
++	bbs_assert(http_get_default_http_port() != -1 || http_get_default_https_port() != -1);
++
++	if (http_get_default_http_port() != -1) {
++		res |= http_register_insecure_route(NULL, (unsigned short int) http_get_default_http_port(), "/tcpinfo", HTTP_METHOD_GET, tcpinfo_handler);
++	}
++	if (http_get_default_https_port() != -1) {
++		res |= http_register_secure_route(NULL, (unsigned short int) http_get_default_https_port(), "/tcpinfo", HTTP_METHOD_GET, tcpinfo_handler);
++	}
++	return res ? unload_module() : res;
++}
++
++BBS_MODULE_INFO_DEPENDENT("HTTP Client Speed Demo", "mod_http.so,net_http.so");
